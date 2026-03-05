@@ -1,14 +1,17 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# MySQL MCP Server — Connection Configuration
-# Copy to .env and fill in your values. Never commit .env to version control.
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# The SSH tunnel is optional per connection.
-# If ssh_host is present, the MCP server spawns and manages its own SSH tunnel
-# for that connection — no external autossh required.
-# ─────────────────────────────────────────────────────────────────────────────
-
-MYSQL_CONNECTIONS='[
+// MySQL MCP Server — connections config
+// Copy to connections.json and fill in your values.
+// Never commit connections.json to version control — add it to .gitignore.
+//
+// Config is loaded from the first source found:
+//   1. Path in MYSQL_CONFIG env var
+//   2. connections.json in the working directory  ← this file's intended location
+//   3. ~/.mysql-mcp/connections.json
+//   4. /etc/mysql-mcp/connections.json
+//   5. Inline JSON in MYSQL_CONNECTIONS env var   (legacy / CI fallback)
+//
+// Line comments (// and #) are stripped before parsing.
+[
+  // ── App database — writes enabled ──────────────────────────────────────
   {
     "name":            "app",
     "label":           "App Database",
@@ -20,10 +23,11 @@ MYSQL_CONNECTIONS='[
     "allow_writes":    true,
     "allowed_dbs":     ["app_db"],
 
+    // SSH tunnel — MCP manages this automatically, no autossh needed
     "ssh_host":        "your-vps.example.com",
     "ssh_port":        22,
     "ssh_user":        "ubuntu",
-    "ssh_key":         "/home/you/.ssh/id_ed25519",
+    "ssh_key":         "/home/you/.ssh/mcp_vps",
     "ssh_remote_host": "127.0.0.1",
     "ssh_remote_port": 3306,
     "ssh_local_port":  13306,
@@ -31,6 +35,8 @@ MYSQL_CONNECTIONS='[
     "ssh_retry_delay": 5,
     "ssh_max_delay":   60
   },
+
+  // ── Analytics database — read-only, higher row limit ───────────────────
   {
     "name":            "analytics",
     "label":           "Analytics Database",
@@ -39,15 +45,18 @@ MYSQL_CONNECTIONS='[
     "user":            "mcp_analytics",
     "password":        "strong_password_2",
     "database":        "analytics_db",
+    "allow_writes":    false,
     "allowed_dbs":     ["analytics_db"],
     "max_rows":        1000,
 
     "ssh_host":        "your-vps.example.com",
     "ssh_user":        "ubuntu",
-    "ssh_key":         "/home/you/.ssh/id_ed25519",
+    "ssh_key":         "/home/you/.ssh/mcp_vps",
     "ssh_remote_port": 3307,
     "ssh_local_port":  13307
   },
+
+  // ── Legacy database — read-only, multiple schemas ───────────────────────
   {
     "name":            "legacy",
     "label":           "Legacy Database",
@@ -55,12 +64,13 @@ MYSQL_CONNECTIONS='[
     "port":            13308,
     "user":            "mcp_legacy",
     "password":        "strong_password_3",
+    "allow_writes":    false,
     "allowed_dbs":     ["legacy_db", "archive_db"],
 
     "ssh_host":        "your-vps.example.com",
     "ssh_user":        "ubuntu",
-    "ssh_key":         "/home/you/.ssh/id_ed25519",
+    "ssh_key":         "/home/you/.ssh/mcp_vps",
     "ssh_remote_port": 3308,
     "ssh_local_port":  13308
   }
-]'
+]
