@@ -352,8 +352,32 @@ class SshTunnel:
                 await asyncio.sleep(self._PORT_POLL_INTERVAL)
         return False
 
+    async def _free_local_port(self) -> None:
+        """Kill any process already listening on the local tunnel port."""
+        port = self.cfg.ssh_local_port
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "lsof", "-ti", f":{port}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await proc.communicate()
+            pids = [int(p) for p in stdout.decode().split() if p.strip().isdigit()]
+            for pid in pids:
+                try:
+                    os.kill(pid, 15)  # SIGTERM
+                    log.info("SSH tunnel '%s': killed stale PID %d on port %d",
+                             self.conn_name, pid, port)
+                except ProcessLookupError:
+                    pass
+            if pids:
+                await asyncio.sleep(0.5)  # give processes time to die
+        except Exception as exc:
+            log.debug("SSH tunnel '%s': _free_local_port error: %s", self.conn_name, exc)
+
     async def _launch_and_wait(self) -> None:
         """Spawn SSH and wait for local port to open. Raises on failure."""
+        await self._free_local_port()
         await self._kill_process()
         log.info(
             "SSH tunnel '%s': connecting to %s:%d → 127.0.0.1:%d",
@@ -597,6 +621,15 @@ _instances: Dict[str, InstanceConfig] = {}
 def _load_instances() -> None:
     raw_env = os.environ.get("MYSQL_CONNECTIONS", "").strip()
     if not raw_env:
+        config_file = os.environ.get("MYSQL_CONFIG", "").strip()
+        if config_file:
+            try:
+                with open(os.path.expanduser(config_file)) as f:
+                    raw_env = f.read()
+            except OSError as exc:
+                log.critical("Cannot read MYSQL_CONFIG file %r: %s", config_file, exc)
+                sys.exit(1)
+    if not raw_env:
         log.critical(
             "MYSQL_CONNECTIONS is not set.\n"
             "Set it to a JSON array, e.g.:\n"
@@ -816,7 +849,7 @@ class InstanceOnlyInput(BaseModel):
 
 # ── Lifespan ───────────────────────────────────────────────────────────────
 @asynccontextmanager
-async def lifespan():
+async def lifespan(app):
     _load_instances()
 
     # 1. Start all SSH tunnels first (blocking until each port is open)
