@@ -597,9 +597,14 @@ class InstanceConfig:
         return None
 
     def summary(self) -> Dict[str, Any]:
+        if self.tunnel:
+            connected = self.tunnel.state == TunnelState.CONNECTED
+        else:
+            connected = self.pool is not None and not self.pool.closed
         d: Dict[str, Any] = {
             "name":              self.name,
             "label":             self.label,
+            "connected":         connected,
             "host":              self.host,
             "port":              self.port,
             "default_database":  self.database,
@@ -741,11 +746,23 @@ async def _run_query(cfg: InstanceConfig, sql: str,
     if err:
         raise PermissionError(f"Query rejected: {err}")
 
-    # If this connection uses a tunnel, check it is up
-    if cfg.tunnel and cfg.tunnel.state != TunnelState.CONNECTED:
+    # Check that the connection has been explicitly established
+    if cfg.tunnel:
+        if cfg.tunnel.state == TunnelState.STOPPED:
+            raise RuntimeError(
+                f"Connection '{cfg.name}' is not connected. "
+                "Call mysql_connect to establish the SSH tunnel first."
+            )
+        if cfg.tunnel.state != TunnelState.CONNECTED:
+            raise RuntimeError(
+                f"SSH tunnel for '{cfg.name}' is {cfg.tunnel.state.value}. "
+                "Reconnection is in progress — please try again shortly. "
+                "Use mysql_reconnect to force a full reconnect."
+            )
+    elif cfg.pool is None:
         raise RuntimeError(
-            f"SSH tunnel for '{cfg.name}' is {cfg.tunnel.state.value}. "
-            "Reconnection is in progress — please try again shortly."
+            f"Connection '{cfg.name}' is not connected. "
+            "Call mysql_connect to establish the connection first."
         )
 
     effective_limit = min(row_limit or cfg.max_rows, cfg.max_rows)
@@ -847,37 +864,24 @@ class InstanceOnlyInput(BaseModel):
     def safe_id(cls, v: Optional[str]) -> Optional[str]: return _safe_id(v)
 
 
+class ConnectInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    instance: str = _INST_FIELD
+
+    @field_validator("instance")
+    @classmethod
+    def safe_id(cls, v: str) -> str: return _safe_id(v)
+
+
 # ── Lifespan ───────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app):
     _load_instances()
-
-    # 1. Start all SSH tunnels first (blocking until each port is open)
-    tunnel_instances = [cfg for cfg in _instances.values() if cfg.tunnel]
-    if tunnel_instances:
-        log.info("Starting %d SSH tunnel(s)…", len(tunnel_instances))
-        for cfg in tunnel_instances:
-            try:
-                await cfg.tunnel.start()
-            except Exception as exc:
-                log.critical("Failed to establish SSH tunnel for '%s': %s", cfg.name, exc)
-                sys.exit(1)
-
-    # 2. Open MySQL connection pools
-    log.info("Connecting MySQL pools for %d instance(s)…", len(_instances))
-    failed = []
-    for name, cfg in _instances.items():
-        try:
-            await _ensure_pool(cfg)
-            log.info("  ✓  '%s' ready", name)
-        except Exception as exc:
-            log.error("  ✗  '%s' pool failed: %s", name, exc)
-            failed.append(name)
-    if failed:
-        log.critical("Cannot open MySQL pool for: %s — fix config and restart.", ", ".join(failed))
-        sys.exit(1)
-
-    log.info("All connections ready ✓")
+    log.info(
+        "MySQL MCP ready — %d connection(s) configured. "
+        "Call mysql_connect to establish a connection before querying.",
+        len(_instances),
+    )
     yield
 
     # Shutdown: close pools then tunnels
@@ -913,6 +917,84 @@ async def mysql_list_instances() -> str:
     """
     return _to_json({"instances": [c.summary() for c in _instances.values()],
                      "count": len(_instances)})
+
+
+@mcp.tool(name="mysql_connect", annotations={
+    "title": "Connect to MySQL Instance", "readOnlyHint": False,
+    "destructiveHint": False, "idempotentHint": True, "openWorldHint": False,
+})
+async def mysql_connect(params: ConnectInput) -> str:
+    """Establish the SSH tunnel (if configured) and open the MySQL connection pool.
+
+    Must be called before running any query on an instance. If already connected,
+    this is a no-op. To force a full reconnect (e.g. stale port from a previous
+    session), use mysql_reconnect instead.
+
+    Args:
+        params (ConnectInput):
+            - instance (str): Connection name (from mysql_list_instances)
+
+    Returns:
+        str: JSON with { success, instance, message, tunnel? }
+    """
+    try:
+        cfg = _get_instance(params.instance)
+        if cfg.tunnel:
+            if cfg.tunnel.state == TunnelState.STOPPED:
+                await cfg.tunnel.start()
+            elif cfg.tunnel.state != TunnelState.CONNECTED:
+                return _to_json({
+                    "success": False,
+                    "instance": cfg.name,
+                    "message": (
+                        f"Tunnel is currently '{cfg.tunnel.state.value}'. "
+                        "Use mysql_reconnect to force a full reconnect."
+                    ),
+                })
+        await _ensure_pool(cfg)
+        result: Dict[str, Any] = {
+            "success": True, "instance": cfg.name, "message": "Connected.",
+        }
+        if cfg.tunnel:
+            result["tunnel"] = cfg.tunnel.status()
+        return _to_json(result)
+    except Exception as exc:
+        return _to_json({"success": False, "error": str(exc), "instance": params.instance})
+
+
+@mcp.tool(name="mysql_reconnect", annotations={
+    "title": "Reconnect MySQL Instance", "readOnlyHint": False,
+    "destructiveHint": False, "idempotentHint": False, "openWorldHint": False,
+})
+async def mysql_reconnect(params: ConnectInput) -> str:
+    """Force a full reconnect: kill stale port processes, restart SSH tunnel, reset MySQL pool.
+
+    Use this when a connection is broken — for example when the local tunnel port
+    is already in use from a previous session, the SSH process died, or the MySQL
+    pool has gone stale. Safe to call even if the connection was never established.
+
+    Args:
+        params (ConnectInput):
+            - instance (str): Connection name (from mysql_list_instances)
+
+    Returns:
+        str: JSON with { success, instance, message, tunnel? }
+    """
+    try:
+        cfg = _get_instance(params.instance)
+        await _reset_pool(cfg)
+        if cfg.tunnel:
+            await cfg.tunnel.stop()          # stop cleanly (sets state → STOPPED)
+            await cfg.tunnel.start()         # _free_local_port runs inside start()
+        await _ensure_pool(cfg)
+        result: Dict[str, Any] = {
+            "success": True, "instance": cfg.name, "message": "Reconnected successfully.",
+        }
+        if cfg.tunnel:
+            result["tunnel"] = cfg.tunnel.status()
+        return _to_json(result)
+    except Exception as exc:
+        return _to_json({"success": False, "error": str(exc), "instance": params.instance})
 
 
 @mcp.tool(name="mysql_query", annotations={
