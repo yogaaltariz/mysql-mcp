@@ -1,3 +1,5 @@
 connections.json
 .claude
 .venv
+
+__pycache__
